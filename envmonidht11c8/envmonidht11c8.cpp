@@ -1,5 +1,5 @@
 /*********************************************************
- * Environment Monitor (ESP8266 D1 R1 + 170x320 TFT + DHT11)
+ * Environment Monitor (ESP8266 D1 mini + 170x320 TFT + DHT11)
  * - 2-min slots (720/day), LittleFS persistence
  * - Web UI: 30-day history + Today (live)
  *
@@ -16,6 +16,7 @@
 #include <DNSServer.h>
 #include <WiFiManager.h>
 #include <ESP8266mDNS.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -45,6 +46,16 @@
 
 #ifndef ENABLE_LDR_SLEEP
   #define ENABLE_LDR_SLEEP 0   // set to 1 to enable LDR-based dark sleep (uses A0; disables battery read)
+#endif
+
+#ifndef ENABLE_OTA
+  #define ENABLE_OTA 1
+#endif
+#ifndef OTA_HOSTNAME
+  #define OTA_HOSTNAME "envmonitor"
+#endif
+#ifndef OTA_PORT
+  #define OTA_PORT 8266
 #endif
 
 #ifndef BAT_VDIV
@@ -87,16 +98,41 @@ static const uint16_t BL_RANGE  = 1023;
 static const uint16_t BL_PWM_HZ = 20000;
 static uint16_t blValue = 900;
 static unsigned long _blLastReapply = 0;
+static bool screenOff = false;
+static bool screenOffForced = false;
+static bool screenOffBySchedule = false;
+static bool screenOffByAuto = false;
+static uint32_t screenAutoOffMs = 0;   // 0 = disabled
+static bool screenScheduleEnabled = false;
+static uint16_t screenScheduleOffMin = 0;
+static uint16_t screenScheduleOnMin = 0;
+static bool screenScheduleOverride = false;
+static uint32_t lastUserActivityMs = 0;
+static bool screenWakeReq = false;
 volatile bool nextScreenReq = false;
 
 static inline uint8_t getBrightnessPct(){
   return (uint8_t)min(100, (int)((blValue * 100 + (BL_RANGE/2)) / BL_RANGE));
 }
+static inline void applyBacklightOutput(){
+  analogWrite(BL_PIN, screenOff ? 0 : blValue);
+  _blLastReapply = millis();
+}
 static inline void applyBrightnessPct(int pct){
   pct = constrain(pct, 0, 100);
   blValue = (uint16_t)((pct * BL_RANGE) / 100);
-  analogWrite(BL_PIN, blValue);
-  _blLastReapply = millis();
+  applyBacklightOutput();
+}
+
+static inline void noteUserActivity(bool wakeAllowed){
+  lastUserActivityMs = millis();
+  if (wakeAllowed && screenOff && !screenOffBySchedule) {
+    screenOff = false;
+    screenOffForced = false;
+    screenOffByAuto = false;
+    applyBacklightOutput();
+    screenWakeReq = true;
+  }
 }
 
 // ===================== Battery (A0) =====================
@@ -298,6 +334,7 @@ static const uint32_t ANCHOR_SAVE_MS = 600000;
 // ===================== Forward decls (core) =====================
 static bool initSensor();
 static void connectWiFi();
+static void initOTA();
 static void initTime();
 static bool isTimeValid();
 static void anchorTimeToNow();
@@ -322,6 +359,7 @@ static void handleDayList();
 static void handleDayData();
 static void handleStatus();
 static void handleToday();
+static void handlePowerSave();
 #if ENABLE_CO2_OFFSET_HTTP
 static void handleCo2Offset();
 #endif
@@ -347,6 +385,7 @@ static void drawCard(const Panel& p){
 
 // callbacks
 void onBtnShort() {
+  noteUserActivity(true);
   nextScreenReq = true;   // keep it minimal/safe
 }
 
@@ -1670,6 +1709,132 @@ static void saveCo2OffsetToFS() {
 }
 #endif
 
+// ===================== FS: power save =====================
+#if ENABLE_FS
+static const char* POWER_CFG_PATH = "/power.cfg";
+
+static void loadPowerCfgFromFS(){
+  if (!fsReady || !LittleFS.exists(POWER_CFG_PATH)) return;
+  File f = LittleFS.open(POWER_CFG_PATH, "r");
+  if (!f) return;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length() || line[0] == '#') continue;
+    int eq = line.indexOf('=');
+    if (eq < 0) continue;
+    String k = line.substring(0, eq); k.trim();
+    String v = line.substring(eq + 1); v.trim();
+    if (k == "autoOffSec") {
+      long secL = v.toInt();
+      if (secL < 0) secL = 0;
+      uint32_t sec = (uint32_t)secL;
+      if (sec > 24UL * 60UL * 60UL) sec = 24UL * 60UL * 60UL;
+      screenAutoOffMs = sec * 1000UL;
+    } else if (k == "schedEnabled") {
+      screenScheduleEnabled = (v.toInt() != 0);
+    } else if (k == "offMin") {
+      int m = v.toInt();
+      if (m < 0) m = 0;
+      if (m > 1439) m = 1439;
+      screenScheduleOffMin = (uint16_t)m;
+    } else if (k == "onMin") {
+      int m = v.toInt();
+      if (m < 0) m = 0;
+      if (m > 1439) m = 1439;
+      screenScheduleOnMin = (uint16_t)m;
+    }
+  }
+  f.close();
+}
+
+static void savePowerCfgToFS(){
+  if (!fsReady) return;
+  File f = LittleFS.open(POWER_CFG_PATH, "w");
+  if (!f) return;
+  f.println("# power settings");
+  f.print("autoOffSec=");
+  f.println(String((unsigned long)(screenAutoOffMs / 1000UL)));
+  f.print("schedEnabled=");
+  f.println(screenScheduleEnabled ? "1" : "0");
+  f.print("offMin=");
+  f.println(String((int)screenScheduleOffMin));
+  f.print("onMin=");
+  f.println(String((int)screenScheduleOnMin));
+  f.close();
+}
+#endif
+
+static bool parseTimeHHMM(const String& s, uint16_t* outMin){
+  if (!outMin) return false;
+  int colon = s.indexOf(':');
+  if (colon <= 0 || colon >= (int)s.length() - 1) return false;
+  int h = 0;
+  int m = 0;
+  for (int i = 0; i < colon; ++i) {
+    char c = s[i];
+    if (!isDigit(c)) return false;
+    h = h * 10 + (c - '0');
+  }
+  for (int i = colon + 1; i < (int)s.length(); ++i) {
+    char c = s[i];
+    if (!isDigit(c)) return false;
+    m = m * 10 + (c - '0');
+  }
+  if (h < 0 || h > 23 || m < 0 || m > 59) return false;
+  *outMin = (uint16_t)(h * 60 + m);
+  return true;
+}
+
+static bool isScheduleActive(){
+  if (!screenScheduleEnabled) return false;
+  if (screenScheduleOffMin == screenScheduleOnMin) return false;
+  time_t ts = approxNow();
+  if (ts <= 0) return false;
+  struct tm ti;
+  localtime_r(&ts, &ti);
+  int curMin = ti.tm_hour * 60 + ti.tm_min;
+  if (screenScheduleOffMin < screenScheduleOnMin) {
+    return curMin >= screenScheduleOffMin && curMin < screenScheduleOnMin;
+  }
+  return curMin >= screenScheduleOffMin || curMin < screenScheduleOnMin;
+}
+
+static void applyScheduleState(){
+  const bool active = isScheduleActive();
+  if (active) {
+    if (screenScheduleOverride) {
+      if (screenOffBySchedule) {
+        screenOffBySchedule = false;
+        if (!screenOffForced && !screenOffByAuto) {
+          screenOff = false;
+          applyBacklightOutput();
+          screenWakeReq = true;
+        }
+      }
+      return;
+    }
+    if (!screenOffBySchedule) {
+      screenOffBySchedule = true;
+      screenOff = true;
+      screenOffByAuto = false;
+      applyBacklightOutput();
+    }
+    return;
+  }
+  if (screenScheduleOverride) {
+    screenScheduleOverride = false;
+  }
+  if (screenOffBySchedule) {
+    screenOffBySchedule = false;
+    if (!screenOffForced && !screenOffByAuto) {
+      screenOff = false;
+      applyBacklightOutput();
+      screenWakeReq = true;
+    }
+  }
+}
+
 // ===================== FS: per-day files =====================
 #if ENABLE_FS
 struct StorageHeader{
@@ -1895,7 +2060,7 @@ static bool initSensor() {
 // ===================== Network / Time =====================
 static void connectWiFi() {
   WiFi.mode(WIFI_STA);
-  WiFi.hostname("envmonitor");
+  WiFi.hostname(OTA_HOSTNAME);
 
   WiFiManager wm;
   wm.setConfigPortalTimeout(120);
@@ -1914,14 +2079,47 @@ static void connectWiFi() {
     Serial.println(WiFi.localIP());
     offlineMode = false;
 
-    if (MDNS.begin("envmonitor")) {
-      Serial.println("mDNS responder started: http://envmonitor.local");
+    if (MDNS.begin(OTA_HOSTNAME)) {
+      Serial.print("mDNS responder started: http://");
+      Serial.print(OTA_HOSTNAME);
+      Serial.println(".local");
       MDNS.addService("http", "tcp", 80);
     } else {
       Serial.println("mDNS responder FAILED");
     }
   }
 }
+
+#if ENABLE_OTA
+static void initOTA() {
+  if (offlineMode || WiFi.status() != WL_CONNECTED) return;
+
+  ArduinoOTA.setPort(OTA_PORT);
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+#ifdef OTA_PASSWORD
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA: start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA: end");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    if (total == 0) return;
+    Serial.printf("OTA: %u%%\n", (progress * 100U) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA: error[%u]\n", (unsigned)error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("OTA ready: %s:%u\n", OTA_HOSTNAME, (unsigned)OTA_PORT);
+}
+#else
+static void initOTA() {}
+#endif
 
 static void initTime() {
   if (!offlineMode) {
@@ -1985,6 +2183,10 @@ body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-ser
 .controls.stack{flex-direction:column;align-items:stretch;gap:8px}
 .controls.stack .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .controls.stack .bar .group{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.controls.stack.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.controls.stack.control-grid .bar{min-height:38px}
+.controls.stack.control-grid .bar.full{grid-column:1/-1}
+@media(max-width:900px){.controls.stack.control-grid{grid-template-columns:1fr}}
 .controls.scroll{
   flex-wrap:nowrap;
   overflow-x:auto;
@@ -1995,8 +2197,8 @@ body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-ser
 .controls.scroll::-webkit-scrollbar{display:none}
 .controls.scroll > *{scroll-snap-align:start}
 .sp{flex:1}
-button,select,label{font:inherit}
-button,select{
+ button,select,input[type=time],label{font:inherit}
+ button,select,input[type=time]{
   height:34px;border-radius:999px;border:1px solid var(--stroke);background:var(--btn);color:var(--text);
   padding:0 11px;cursor:pointer;touch-action:manipulation
 }
@@ -2010,6 +2212,12 @@ select{min-width:220px}
 }
 .range{display:inline-flex;align-items:center;gap:10px;padding-right:12px}
 .range input[type=range]{width:140px;accent-color:var(--accent)}
+.range.tight input[type=range]{width:90px}
+.range .val{min-width:16px;text-align:right;font-variant-numeric:tabular-nums;opacity:.8}
+.chip.time input[type=time]{
+  height:28px;border-radius:10px;border:1px solid var(--stroke);background:rgba(0,0,0,.16);color:var(--text);
+  padding:0 8px
+}
 .chip.stale{opacity:.55}
 .dot{width:10px;height:10px;border-radius:50%}
 .dot.co2{background:var(--co2)}.dot.t{background:var(--temp)}.dot.h{background:var(--hum)}.dot.batt{background:#9ff770}
@@ -2036,7 +2244,7 @@ canvas{
   .wrap{padding:10px}
   .head{padding:10px}
   .card{padding:10px}
-  button,select{
+  button,select,input[type=time]{
     height:42px;
     padding:0 14px;
     font-size:15px;
@@ -2064,15 +2272,20 @@ canvas{
 </div></div>
 
 <div class="card">
-  <div class="controls stack">
+  <div class="controls stack control-grid">
     <div class="bar">
       <div class="group">
         <button class="pill" id="prev">Prev</button>
         <button class="pill" id="next">Next</button>
         <select id="day"></select>
       </div>
+    </div>
+    <div class="bar">
       <div class="group">
         <label class="chip"><input id="smooth" type="checkbox" checked style="accent-color:var(--accent)"> Smooth</label>
+        <label class="chip range tight" title="Smoothing strength">
+          <span>Smoothness</span><input id="smoothAmt" type="range" min="1" max="6" step="1" value="3"><span class="val" id="smoothAmtVal">3</span>
+        </label>
         <select id="mode" style="min-width:150px">
           <option value="line">CO2 Line</option>
           <option value="area">CO2 Area</option>
@@ -2084,10 +2297,30 @@ canvas{
         <button class="pill" data-r="all">All</button>
       </div>
     </div>
-    <div class="bar">
+    <div class="bar full">
       <div class="chip" id="liveChip"><span class="dot co2"></span><span id="live">Live: --</span></div>
       <div class="sp"></div>
       <label class="chip range" title="TFT brightness"><span>Brightness</span><input id="br" type="range" min="5" max="100" value="90"></label>
+      <select id="autoOff" title="Auto screen-off timeout" style="min-width:160px">
+        <option value="0">Auto off: disabled</option>
+        <option value="30">Auto off: 30s</option>
+        <option value="60">Auto off: 1m</option>
+        <option value="300">Auto off: 5m</option>
+        <option value="900">Auto off: 15m</option>
+        <option value="1800">Auto off: 30m</option>
+      </select>
+      <button class="pill" id="scr" title="Toggle screen on/off">Screen: On</button>
+    </div>
+    <div class="bar full">
+      <label class="chip" title="Enable daily screen schedule">
+        <input id="schedOn" type="checkbox" style="accent-color:var(--accent)"> Schedule
+      </label>
+      <label class="chip time" title="Screen off time">
+        <span>Off</span><input id="offAt" type="time" value="22:00" step="60">
+      </label>
+      <label class="chip time" title="Screen on time">
+        <span>On</span><input id="onAt" type="time" value="06:30" step="60">
+      </label>
     </div>
   </div>
 </div><div class="card">
@@ -2125,8 +2358,10 @@ canvas{
             s:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
 
   const sel=$("day"), cv=$("cv"), ctx=cv.getContext("2d"), tip=$("tip"), br=$("br");
+  const scrBtn=$("scr"), autoOff=$("autoOff"), schedOn=$("schedOn"), offAt=$("offAt"), onAt=$("onAt");
   const liveEl=$("live"), liveChip=$("liveChip"), battEl=$("batt"), battChip=$("battChip");
-  const smoothEl=$("smooth"), modeEl=$("mode"), cOn=$("cOn"), tOn=$("tOn"), hOn=$("hOn");
+  const smoothEl=$("smooth"), smoothAmt=$("smoothAmt"), smoothAmtVal=$("smoothAmtVal");
+  const modeEl=$("mode"), cOn=$("cOn"), tOn=$("tOn"), hOn=$("hOn");
 
   let dayList=[], data=null, lastStatusT=0;
   let statusSlot=null;
@@ -2143,6 +2378,7 @@ canvas{
   let viewCache=null;
   let lastTodayFetchT=0;
   let lastTodaySlot=null;
+  let screenIsOff=false;
 
   function scheduleDraw(){
     if(drawQueued) return;
@@ -2174,8 +2410,26 @@ canvas{
     const m=(i|0)*(stepMin||5), hh=Math.floor(m/60)%24, mm=m%60;
     return String(hh).padStart(2,"0")+":"+String(mm).padStart(2,"0");
   }
+  function fmtHM(min){
+    const m=Math.max(0, Math.min(1439, min|0));
+    const hh=Math.floor(m/60), mm=m%60;
+    return String(hh).padStart(2,"0")+":"+String(mm).padStart(2,"0");
+  }
   function setBrightnessUI(pct){
     if (br) br.value = pct;
+  }
+  function clampSmoothAmt(v){
+    v = parseInt(v||"3",10);
+    if (!isFinite(v)) v = 3;
+    if (v < 1) v = 1;
+    if (v > 6) v = 6;
+    return v;
+  }
+  function setSmoothAmtUI(v){
+    const amt = clampSmoothAmt(v);
+    if (smoothAmt) smoothAmt.value = String(amt);
+    if (smoothAmtVal) smoothAmtVal.textContent = String(amt);
+    return amt;
   }
   function sendBrightness(pct){
     if (!br) return;
@@ -2185,6 +2439,24 @@ canvas{
 
   function fetchJSON(url){
     return fetch(url,{cache:"no-store"}).then(r=>r.json());
+  }
+
+  function setPowerUI(js){
+    if(!js) return;
+    if (autoOff && js.autoOffSec!=null) autoOff.value = String(js.autoOffSec|0);
+    if (js.screenOff!=null) screenIsOff = !!js.screenOff;
+    if (scrBtn && js.screenOff!=null) scrBtn.textContent = screenIsOff ? "Screen: Off" : "Screen: On";
+    if (schedOn && js.schedEnabled!=null) schedOn.checked = !!js.schedEnabled;
+    if (offAt && js.offMin!=null) offAt.value = fmtHM(js.offMin);
+    if (onAt && js.onMin!=null) onAt.value = fmtHM(js.onMin);
+  }
+  function fetchPower(){
+    if(!scrBtn && !autoOff) return;
+    fetchJSON("/api/power").then(setPowerUI).catch(()=>{});
+  }
+  function sendPower(params){
+    const q=new URLSearchParams(params||{}).toString();
+    fetch(`/api/power?${q}`, {method:"POST"}).then(()=>fetchPower()).catch(()=>{});
   }
 
   function fetchStatus(){
@@ -2269,6 +2541,8 @@ canvas{
   function restorePrefs(){
     setTheme(LS.g("theme","dark"));
     smoothEl.checked=LS.g("smooth",true);
+    setSmoothAmtUI(LS.g("smoothAmt",3));
+    if (smoothAmt) smoothAmt.disabled = !smoothEl.checked;
     modeEl.value=LS.g("mode","line");
     cOn.checked=LS.g("cOn",true);
     tOn.checked=LS.g("tOn",true);
@@ -2276,6 +2550,7 @@ canvas{
   }
   function savePrefs(){
     LS.s("smooth",!!smoothEl.checked);
+    LS.s("smoothAmt",clampSmoothAmt(smoothAmt ? smoothAmt.value : 3));
     LS.s("mode",modeEl.value||"line");
     LS.s("cOn",!!cOn.checked);
     LS.s("tOn",!!tOn.checked);
@@ -2288,6 +2563,21 @@ canvas{
     scheduleDraw();
     renderStats();
   }));
+  if (smoothEl){
+    smoothEl.addEventListener("change",()=>{
+      if (smoothAmt) smoothAmt.disabled = !smoothEl.checked;
+    });
+  }
+  if (smoothAmt){
+    smoothAmt.addEventListener("input",()=>{
+      setSmoothAmtUI(smoothAmt.value);
+      savePrefs();
+      smoothCacheKey="";
+      viewCacheKey="";
+      scheduleDraw();
+      renderStats();
+    });
+  }
   if (br){
     br.addEventListener("input",()=>{
       const v=parseInt(br.value||"0",10);
@@ -2297,6 +2587,36 @@ canvas{
     br.addEventListener("change",()=>{
       const v=parseInt(br.value||"0",10);
       sendBrightness(v);
+    });
+  }
+  if (scrBtn){
+    scrBtn.addEventListener("click",()=>{
+      sendPower({off: screenIsOff ? 0 : 1});
+    });
+  }
+  if (autoOff){
+    autoOff.addEventListener("change",()=>{
+      const sec=parseInt(autoOff.value||"0",10);
+      sendPower({auto: isFinite(sec)?sec:0});
+    });
+  }
+  if (schedOn){
+    schedOn.addEventListener("change",()=>{
+      const enabled = !!schedOn.checked;
+      const params = {sched: enabled ? 1 : 0};
+      if (offAt && offAt.value) params.offAt = offAt.value;
+      if (onAt && onAt.value) params.onAt = onAt.value;
+      sendPower(params);
+    });
+  }
+  if (offAt){
+    offAt.addEventListener("change",()=>{
+      if (offAt.value) sendPower({offAt: offAt.value});
+    });
+  }
+  if (onAt){
+    onAt.addEventListener("change",()=>{
+      if (onAt.value) sendPower({onAt: onAt.value});
     });
   }
 
@@ -2354,19 +2674,25 @@ canvas{
   }
   let rt=0; window.addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(resize,120)});
 
-  // ----- smoothing (3-tap, gap-aware) -----
+  // ----- smoothing (5-tap, gap-aware, two-pass) -----
   function smooth(arr, isGap){
     if(!smoothEl.checked) return arr;
-    const out=arr.slice();
-    for(let i=0;i<arr.length;i++){
-      const v=arr[i]; if(isGap(v)) continue;
-      let s=0,c=0;
-      for(let k=-1;k<=1;k++){
-        const j=i+k; if(j<0||j>=arr.length) continue;
-        const vv=arr[j]; if(isGap(vv)) continue;
-        s+=vv; c++;
+    const weights=[1,2,3,2,1];
+    const passes=clampSmoothAmt(smoothAmt ? smoothAmt.value : 3);
+    let out=arr.slice();
+    for(let pass=0; pass<passes; pass++){
+      const src=out.slice();
+      for(let i=0;i<src.length;i++){
+        const v=src[i]; if(isGap(v)) continue;
+        let s=0,w=0;
+        for(let k=-2;k<=2;k++){
+          const j=i+k; if(j<0||j>=src.length) continue;
+          const vv=src[j]; if(isGap(vv)) continue;
+          const wt=weights[k+2];
+          s+=vv*wt; w+=wt;
+        }
+        if(w) out[i]=s/w;
       }
-      if(c) out[i]=s/c;
     }
     return out;
   }
@@ -2611,7 +2937,8 @@ canvas{
     const yH=(v)=>yMap(v,hmin,hmax,gy0,gy1);
     const yA=(v)=>yMap(v,aMin,aMax,gy0,gy1);
 
-    const smKey=`${dataVer}|${smoothEl.checked?1:0}`;
+    const smoothLevel = smoothEl.checked ? clampSmoothAmt(smoothAmt ? smoothAmt.value : 3) : 0;
+    const smKey=`${dataVer}|${smoothLevel}`;
     if(smKey!==smoothCacheKey){
       smoothCacheKey=smKey;
       if(smoothEl.checked){
@@ -2966,6 +3293,7 @@ canvas{
   restorePrefs();
   fetchStatus(); setInterval(fetchStatus,30000);
   fetchBrightness(); setInterval(fetchBrightness,60000);
+  fetchPower(); setInterval(fetchPower,60000);
   setInterval(tickLiveChip,1500);
   setInterval(todayTick,15000);
 
@@ -2978,10 +3306,12 @@ canvas{
 
 // ---------- Web handler ----------
 static void handleWebRoot() {
+  noteUserActivity(!screenOffForced);
   server.send_P(200, "text/html; charset=utf-8", WEB_ROOT_HTML);
 }
 
 static void handleStatus() {
+  noteUserActivity(!screenOffForced);
   // No caching
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
@@ -3013,6 +3343,10 @@ static void handleStatus() {
   out += (isnan(batteryV) ? "null" : String(batteryV, 2));
   out += ",\"brightness\":";
   out += String((int)getBrightnessPct());
+  out += ",\"screenOff\":";
+  out += (screenOff ? "true" : "false");
+  out += ",\"autoOffSec\":";
+  out += String((unsigned long)(screenAutoOffMs / 1000UL));
   out += ",\"fsReady\":";
   out += (fsReady ? "true" : "false");
   out += ",\"lastSaveMs\":";
@@ -3039,6 +3373,7 @@ static void handleStatus() {
 
 #if ENABLE_BL_HTTP
 static void handleBrightness() {
+  noteUserActivity(!screenOffForced);
   int pct = getBrightnessPct();
   if (server.hasArg("pct")) {
     int v = server.arg("pct").toInt();
@@ -3054,8 +3389,93 @@ static void handleBrightness() {
 }
 #endif
 
+static void handlePowerSave() {
+  bool changed = false;
+
+  if (server.hasArg("auto")) {
+    int sec = server.arg("auto").toInt();
+    if (sec < 0) sec = 0;
+    if (sec > (int)(24UL * 60UL * 60UL)) sec = (int)(24UL * 60UL * 60UL);
+    screenAutoOffMs = (uint32_t)sec * 1000UL;
+    changed = true;
+  }
+  if (server.hasArg("sched")) {
+    screenScheduleEnabled = (server.arg("sched").toInt() != 0);
+    changed = true;
+  }
+  if (server.hasArg("offAt")) {
+    uint16_t m = 0;
+    if (parseTimeHHMM(server.arg("offAt"), &m)) {
+      screenScheduleOffMin = m;
+      changed = true;
+    }
+  }
+  if (server.hasArg("onAt")) {
+    uint16_t m = 0;
+    if (parseTimeHHMM(server.arg("onAt"), &m)) {
+      screenScheduleOnMin = m;
+      changed = true;
+    }
+  }
+
+  if (server.hasArg("off")) {
+    const bool wantOff = server.arg("off").toInt() != 0;
+    if (wantOff) {
+      lastUserActivityMs = millis();
+      screenOff = true;
+      screenOffForced = true;
+      screenOffByAuto = false;
+      screenScheduleOverride = false;
+      applyBacklightOutput();
+    } else {
+      screenOffByAuto = false;
+      screenOffForced = false;
+      if (screenScheduleEnabled && isScheduleActive()) {
+        screenScheduleOverride = true;
+        screenOffBySchedule = false;
+      } else {
+        screenScheduleOverride = false;
+      }
+      screenOff = false;
+      applyBacklightOutput();
+      screenWakeReq = true;
+      lastUserActivityMs = millis();
+    }
+    changed = true;
+  } else {
+    noteUserActivity(!screenOffForced);
+  }
+
+#if ENABLE_FS
+  if (changed) savePowerCfgToFS();
+#endif
+
+  applyScheduleState();
+
+  String out;
+  out.reserve(140);
+  out += "{";
+  out += "\"screenOff\":";
+  out += (screenOff ? "true" : "false");
+  out += ",\"forced\":";
+  out += (screenOffForced ? "true" : "false");
+  out += ",\"autoOffSec\":";
+  out += String((unsigned long)(screenAutoOffMs / 1000UL));
+  out += ",\"schedEnabled\":";
+  out += (screenScheduleEnabled ? "true" : "false");
+  out += ",\"offMin\":";
+  out += String((int)screenScheduleOffMin);
+  out += ",\"onMin\":";
+  out += String((int)screenScheduleOnMin);
+  out += ",\"schedActive\":";
+  out += (screenOffBySchedule ? "true" : "false");
+  out += "}";
+  server.send(200, "application/json", out);
+}
+
 #if ENABLE_CO2_OFFSET_HTTP
 static void handleCo2Offset() {
+  noteUserActivity(!screenOffForced);
   int v = (int)co2OffsetPpm;
   if (server.hasArg("ppm")) {
     v = server.arg("ppm").toInt();
@@ -3074,6 +3494,7 @@ static void handleCo2Offset() {
 
 
 static void handleToday() {
+  noteUserActivity(!screenOffForced);
   writeLiveSlotPreviewToBuffers();
 
   // No caching
@@ -3135,6 +3556,7 @@ static void handleToday() {
 
 
 static void handleDayList() {
+  noteUserActivity(!screenOffForced);
 #if !ENABLE_FS
   server.send(200, "application/json", "[]");
 #else
@@ -3206,6 +3628,7 @@ static void handleDayList() {
 
 
 static void handleDayData() {
+  noteUserActivity(!screenOffForced);
 #if !ENABLE_FS
   server.send(200, "application/json", "{}");
   return;
@@ -3289,7 +3712,7 @@ static void handleDayData() {
 
 // ===================== setup / loop =====================
 void setup(){
-  Serial.begin(9600);
+  Serial.begin(115200);
   bootTime = millis();
 
   // Backlight
@@ -3328,6 +3751,7 @@ void setup(){
   if (fsReady) {
     loadTimeAnchor();
     loadCo2OffsetFromFS();
+    loadPowerCfgFromFS();
     loadDataFromFS();
   }
 #endif
@@ -3337,6 +3761,7 @@ void setup(){
 
   // WiFi + Time
   connectWiFi();
+  initOTA();
   initTime();
   if (isTimeValid()) anchorTimeToNow();
 
@@ -3346,6 +3771,7 @@ void setup(){
   server.on("/api/daydata", HTTP_GET, handleDayData);
   server.on("/api/today",   HTTP_GET, handleToday);
   server.on("/status",      HTTP_GET, handleStatus);
+  server.on("/api/power",   HTTP_ANY, handlePowerSave);
 #if ENABLE_BL_HTTP
   server.on("/api/brightness", HTTP_ANY, handleBrightness);
 #endif
@@ -3373,6 +3799,9 @@ void setup(){
   }
 
 
+  lastUserActivityMs = millis();
+  applyScheduleState();
+
   // Initial render
   drawAllScreens();
 }
@@ -3384,13 +3813,29 @@ void loop() {
   if (nowMs - _blLastReapply > 60000UL) {
     analogWriteFreq(BL_PWM_HZ);
     analogWriteRange(BL_RANGE);
-    applyBrightnessPct(getBrightnessPct());
+    applyBacklightOutput();
   }
 
   // ---------- Network tasks ----------
   if (WiFi.getMode() != WIFI_OFF) {
     server.handleClient();
-    if (WiFi.status() == WL_CONNECTED) MDNS.update();
+    if (WiFi.status() == WL_CONNECTED) {
+      MDNS.update();
+#if ENABLE_OTA
+      ArduinoOTA.handle();
+#endif
+    }
+  }
+
+  // ---------- Scheduled screen off/on ----------
+  applyScheduleState();
+
+  // ---------- Auto screen-off ----------
+  if (screenAutoOffMs && !screenOffForced && !screenOffBySchedule && !screenOffByAuto &&
+      !screenOff && (nowMs - lastUserActivityMs >= screenAutoOffMs)) {
+    screenOffByAuto = true;
+    screenOff = true;
+    applyBacklightOutput();
   }
 
   // ---------- Button state machine ----------
@@ -3416,6 +3861,14 @@ void loop() {
     lastFast30mDraw = 0;
     lastRedraw      = 0;
 
+    drawAllScreens();
+    screenWakeReq = false; // draw covers wake-up redraw too
+  }
+
+  if (screenWakeReq && !screenOff) {
+    screenWakeReq = false;
+    lastFast30mDraw = 0;
+    lastRedraw      = 0;
     drawAllScreens();
   }
 
@@ -3484,7 +3937,7 @@ void loop() {
     lastDrawnSlot = slot;
 
     // Redraw on slot change
-    drawAllScreens();
+    if (!screenOff) drawAllScreens();
   }
 
   // ---------- Sensor read / watchdog ----------
@@ -3565,22 +4018,24 @@ void loop() {
 #endif
 
   // ---------- Display refresh ----------
-  // Fast refresh on 30m screen (lighter)
-  if (screenMode == 0 && (nowMs - lastFast30mDraw >= FAST_30M_REFRESH_MS)) {
-    lastFast30mDraw = nowMs;
-    drawHeader();
-    drawTabs();
-    draw30MinDashboard();
-  }
+  if (!screenOff) {
+    // Fast refresh on 30m screen (lighter)
+    if (screenMode == 0 && (nowMs - lastFast30mDraw >= FAST_30M_REFRESH_MS)) {
+      lastFast30mDraw = nowMs;
+      drawHeader();
+      drawTabs();
+      draw30MinDashboard();
+    }
 
-  // Slower full refresh on other screens
-  if (screenMode != 0 && (nowMs - lastRedraw >= REDRAW_INTERVAL)) {
-    lastRedraw = nowMs;
-    drawAllScreens();
+    // Slower full refresh on other screens
+    if (screenMode != 0 && (nowMs - lastRedraw >= REDRAW_INTERVAL)) {
+      lastRedraw = nowMs;
+      drawAllScreens();
+    }
   }
 
   // Keep WDT happy but stay responsive
   yield();
-  delay(10);
+  delay(screenOff ? 60 : 10);
 }
 
