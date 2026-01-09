@@ -28,6 +28,14 @@
 
 
                                  ===================== User Interface. =====================
+UI
 
-<img width="863" height="702" alt="image" src="https://github.com/user-attachments/assets/b80e6f18-e9b9-4692-a44c-9d2dd6089b90" />
+<img width="874" height="702" alt="image" src="https://github.com/user-attachments/assets/3df14214-c6ac-40b7-aee9-07674b1039bd" />
+
+TFT
+
+<img width="650" height="355" alt="image" src="https://github.com/user-attachments/assets/172346d1-8ed0-470f-854a-f34563e7f5d4" />
+
+
+
 
